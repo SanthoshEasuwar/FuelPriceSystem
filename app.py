@@ -35,6 +35,11 @@ def load_data():
         predictions["target_date"], errors="coerce"
     )
 
+    # Display data from January 1, 2022 onward.
+    cutoff_date = pd.Timestamp("2022-01-01")
+    fuel = fuel[fuel["date"] >= cutoff_date].copy()
+    crude = crude[crude["date"] >= cutoff_date].copy()
+
     # Reproduce the correction used during model development.
     correction = (
         fuel["date"].between("2022-06-01", "2022-06-30")
