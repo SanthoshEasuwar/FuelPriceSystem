@@ -1,8 +1,8 @@
 from pathlib import Path
 
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
-import plotly.express as px
 
 st.set_page_config(
     page_title="Fuel Price Prediction System",
@@ -10,9 +10,11 @@ st.set_page_config(
     layout="wide",
 )
 
-ROOT = Path(__file__).resolve().parent
-DATA_DIR = ROOT / "Data"
-MODEL_DIR = ROOT / "models"
+BASE = Path(__file__).resolve().parent
+DATA_DIR = BASE / "Data"
+MODEL_DIR = BASE / "models"
+
+CITIES = ["Chennai", "Delhi", "Mumbai", "Kolkata"]
 
 @st.cache_data
 def load_data():
@@ -22,29 +24,38 @@ def load_data():
     predictions = pd.read_csv(MODEL_DIR / "test_predictions.csv")
 
     fuel["date"] = pd.to_datetime(fuel["date"], errors="coerce")
-    crude["date"] = pd.to_datetime(crude["date"], errors="coerce", utc=True)
-    crude["date"] = crude["date"].dt.tz_localize(None)
-    predictions["date"] = pd.to_datetime(predictions["date"], errors="coerce")
+    crude["date"] = pd.to_datetime(
+        crude["date"], errors="coerce", utc=True
+    ).dt.tz_localize(None)
+
+    predictions["date"] = pd.to_datetime(
+        predictions["date"], errors="coerce"
+    )
     predictions["target_date"] = pd.to_datetime(
         predictions["target_date"], errors="coerce"
     )
 
-    # Apply the same in-memory correction used during model development.
-    # The original CSV is never changed.
+    # Reproduce the correction used during model development.
     correction = (
-        (fuel["date"] >= "2022-06-01")
-        & (fuel["date"] <= "2022-06-30")
-        & (fuel["city"].isin(["Chennai", "Delhi", "Mumbai", "Kolkata"]))
+        fuel["date"].between("2022-06-01", "2022-06-30")
+        & fuel["city"].isin(CITIES)
     )
-    petrol_values = fuel.loc[
+    old_petrol = fuel.loc[
         correction, "petrol_price_inr_per_litre"
     ].copy()
-    fuel.loc[correction, "petrol_price_inr_per_litre"] = fuel.loc[
-        correction, "diesel_price_inr_per_litre"
-    ].values
-    fuel.loc[correction, "diesel_price_inr_per_litre"] = petrol_values.values
+
+    fuel.loc[correction, "petrol_price_inr_per_litre"] = (
+        fuel.loc[correction, "diesel_price_inr_per_litre"].values
+    )
+    fuel.loc[correction, "diesel_price_inr_per_litre"] = old_petrol.values
 
     return fuel, crude, metrics, predictions
+
+st.title("⛽ Fuel Price Prediction System")
+st.markdown(
+    "Explore historical fuel prices, evaluate model performance, "
+    "and investigate future price scenarios."
+)
 
 try:
     fuel, crude, metrics, predictions = load_data()
@@ -52,158 +63,279 @@ except Exception as exc:
     st.error(f"Unable to load project files: {exc}")
     st.stop()
 
-st.title("⛽ Fuel Price Prediction System")
-st.write(
-    "Explore historical petrol and diesel prices and view a next-day "
-    "estimate based on the latest available observation in the dataset."
-)
-
+latest_dataset_date = fuel["date"].max()
 st.info(
-    "Dataset limitation: these predictions are based on historical data, "
-    "not live fuel prices. The latest recorded date is shown below."
+    f"Historical fuel dataset ends on {latest_dataset_date:%d %B %Y}. "
+    "Forecasts below are based on historical data, not live market prices."
 )
 
-cities = ["Chennai", "Delhi", "Mumbai", "Kolkata"]
-city = st.sidebar.selectbox("Select city", cities)
-fuel_type = st.sidebar.radio("Select fuel type", ["Petrol", "Diesel"])
+# ---------------- SIDEBAR INPUTS ----------------
+st.sidebar.header("Forecast settings")
+city = st.sidebar.selectbox("City", CITIES)
+fuel_type = st.sidebar.selectbox("Fuel type", ["Petrol", "Diesel"])
 
-price_column = (
+price_col = (
     "petrol_price_inr_per_litre"
     if fuel_type == "Petrol"
     else "diesel_price_inr_per_litre"
 )
 
-city_data = (
+target_col = (
+    "target_petrol_tomorrow"
+    if fuel_type == "Petrol"
+    else "target_diesel_tomorrow"
+)
+
+pred_col = (
+    "predicted_petrol"
+    if fuel_type == "Petrol"
+    else "predicted_diesel"
+)
+
+city_history = (
     fuel.loc[
-        (fuel["city"] == city) & fuel[price_column].notna(),
-        ["date", price_column],
+        (fuel["city"] == city) & fuel[price_col].notna(),
+        ["date", price_col],
     ]
     .dropna()
     .sort_values("date")
     .drop_duplicates("date", keep="last")
 )
 
-if city_data.empty:
-    st.error("No price data is available for this selection.")
+if city_history.empty:
+    st.error("No historical prices are available for this city.")
     st.stop()
 
-latest = city_data.iloc[-1]
-latest_date = latest["date"]
-latest_price = float(latest[price_column])
-prediction_date = latest_date + pd.Timedelta(days=1)
+last_row = city_history.iloc[-1]
+last_date = last_row["date"]
+last_price = float(last_row[price_col])
 
-# The selected model is the persistence baseline: tomorrow's estimate
-# equals the latest recorded price.
-predicted_price = latest_price
+starting_price = st.sidebar.number_input(
+    "Starting price (₹ per litre)",
+    min_value=0.01,
+    max_value=10000.0,
+    value=last_price,
+    step=0.10,
+    help="Change this to explore a what-if scenario.",
+)
 
-st.subheader(f"{city} — {fuel_type} overview")
+horizon = st.sidebar.slider(
+    "Forecast horizon (days)", min_value=1, max_value=30, value=7
+)
 
-col1, col2, col3 = st.columns(3)
-col1.metric("Latest recorded price", f"₹{latest_price:.2f}/L")
-col2.metric("Next-day estimate", f"₹{predicted_price:.2f}/L")
-col3.metric("Latest data date", latest_date.strftime("%d %b %Y"))
+daily_change_pct = st.sidebar.slider(
+    "Assumed daily change (%)",
+    min_value=-2.0,
+    max_value=2.0,
+    value=0.0,
+    step=0.1,
+    help="Used only for the what-if scenario, not the ML forecast.",
+)
+
+# ---------------- OVERVIEW ----------------
+st.subheader(f"{city} {fuel_type} dashboard")
+
+a, b, c = st.columns(3)
+a.metric("Latest recorded price", f"₹{last_price:.2f}/L")
+b.metric("User-selected starting price", f"₹{starting_price:.2f}/L")
+c.metric("Historical data through", last_date.strftime("%d %b %Y"))
 
 st.caption(
-    f"Estimated date: {prediction_date.strftime('%d %b %Y')}. "
-    "The estimate assumes no price change and is not a live market forecast."
+    "The forecast starts after the latest date in the dataset. "
+    "The user-selected starting price is used for the what-if scenario."
 )
 
-st.divider()
-st.subheader("Historical fuel price")
-
-fig = px.line(
-    city_data,
-    x="date",
-    y=price_column,
-    title=f"{city} {fuel_type.lower()} price history",
-    labels={
-        "date": "Date",
-        price_column: "Price (₹ per litre)",
-    },
+# ---------------- HISTORICAL AND FUTURE GRAPHS ----------------
+future_dates = pd.date_range(
+    start=last_date + pd.Timedelta(days=1),
+    periods=horizon,
+    freq="D",
 )
-fig.update_layout(hovermode="x unified")
+
+# Selected model is the persistence baseline. It carries forward the
+# last recorded price; it does not independently predict price changes.
+model_prices = [last_price] * horizon
+
+# Scenario compounds the user-selected assumed daily percentage change.
+scenario_prices = []
+scenario_price = starting_price
+
+for _ in range(horizon):
+    scenario_price *= 1 + daily_change_pct / 100
+    scenario_prices.append(scenario_price)
+
+history_window = city_history.tail(180)
+
+fig = go.Figure()
+fig.add_trace(
+    go.Scatter(
+        x=history_window["date"],
+        y=history_window[price_col],
+        mode="lines",
+        name="Historical actual price",
+        line=dict(width=2),
+    )
+)
+fig.add_trace(
+    go.Scatter(
+        x=future_dates,
+        y=model_prices,
+        mode="lines+markers",
+        name="Baseline model forecast",
+        line=dict(dash="dash", width=3),
+    )
+)
+fig.add_trace(
+    go.Scatter(
+        x=future_dates,
+        y=scenario_prices,
+        mode="lines+markers",
+        name="User what-if scenario",
+        line=dict(dash="dot", width=3),
+    )
+)
+fig.add_vline(
+    x=last_date.timestamp() * 1000,
+    line_dash="dash",
+    annotation_text="Forecast begins",
+)
+fig.update_layout(
+    title=f"{city} {fuel_type}: historical prices and future scenarios",
+    xaxis_title="Date",
+    yaxis_title="Price (₹ per litre)",
+    hovermode="x unified",
+    legend_title="Series",
+)
 st.plotly_chart(fig, use_container_width=True)
 
-st.subheader("Recent price records")
-recent = city_data.tail(15).sort_values("date", ascending=False).copy()
-recent["date"] = recent["date"].dt.strftime("%Y-%m-%d")
-recent = recent.rename(
-    columns={price_column: f"{fuel_type} price (₹/L)"}
+left, right = st.columns(2)
+left.metric(
+    f"Baseline estimate after {horizon} days",
+    f"₹{model_prices[-1]:.2f}/L",
 )
-st.dataframe(recent, use_container_width=True, hide_index=True)
+right.metric(
+    f"What-if price after {horizon} days",
+    f"₹{scenario_prices[-1]:.2f}/L",
+    delta=f"{scenario_prices[-1] - starting_price:+.2f} ₹/L",
+)
 
-# --------------------------------------------------
-# Crude oil history
-# --------------------------------------------------
+st.warning(
+    "The baseline forecast assumes no price change. The what-if line "
+    "applies your assumed daily percentage and is not an ML prediction."
+)
+
+future_table = pd.DataFrame({
+    "Forecast date": future_dates,
+    "Baseline forecast (₹/L)": model_prices,
+    "What-if scenario (₹/L)": scenario_prices,
+})
+st.subheader("Future price table")
+st.dataframe(future_table, use_container_width=True, hide_index=True)
+
+# ---------------- MODEL METRICS ----------------
 st.divider()
-st.subheader("Crude oil price history")
+st.header("Model evaluation")
+st.write(
+    "MAE and RMSE are computed from the held-out test period. "
+    "Lower values indicate smaller prediction errors."
+)
 
-crude_plot = crude.dropna(subset=["date", "price"]).sort_values("date")
-if not crude_plot.empty:
-    crude_fig = px.line(
-        crude_plot,
-        x="date",
-        y="price",
-        title="Historical crude oil prices from the supplied CSV",
-        labels={"date": "Date", "price": "Price (source units)"},
+fuel_metrics = metrics[
+    metrics["fuel"].astype(str).str.lower() == fuel_type.lower()
+]
+
+if not fuel_metrics.empty:
+    st.dataframe(fuel_metrics, use_container_width=True, hide_index=True)
+
+    baseline = fuel_metrics[
+        fuel_metrics["model"] == "PersistenceBaseline"
+    ]
+    if not baseline.empty:
+        m1, m2 = st.columns(2)
+        m1.metric("Test MAE", f"₹{float(baseline.iloc[0]['test_MAE']):.4f}/L")
+        m2.metric("Test RMSE", f"₹{float(baseline.iloc[0]['test_RMSE']):.4f}/L")
+else:
+    st.warning("No saved metrics were found for this fuel type.")
+
+# ---------------- ACTUAL VS PREDICTED TEST DATA ----------------
+st.subheader("Actual vs. predicted on the historical test set")
+
+if {"city", "target_date", target_col, pred_col}.issubset(predictions.columns):
+    test_city = predictions[
+        predictions["city"] == city
+    ].dropna(subset=["target_date", target_col, pred_col]).sort_values(
+        "target_date"
+    )
+
+    if not test_city.empty:
+        test_fig = go.Figure()
+        test_fig.add_trace(
+            go.Scatter(
+                x=test_city["target_date"],
+                y=test_city[target_col],
+                mode="lines",
+                name="Actual",
+            )
+        )
+        test_fig.add_trace(
+            go.Scatter(
+                x=test_city["target_date"],
+                y=test_city[pred_col],
+                mode="lines",
+                name="Predicted",
+                line=dict(dash="dash"),
+            )
+        )
+        test_fig.update_layout(
+            title=f"{city} {fuel_type}: held-out test predictions",
+            xaxis_title="Date",
+            yaxis_title="Price (₹ per litre)",
+            hovermode="x unified",
+        )
+        st.plotly_chart(test_fig, use_container_width=True)
+
+        errors = test_city[pred_col] - test_city[target_col]
+        mae = errors.abs().mean()
+        rmse = (errors.pow(2).mean()) ** 0.5
+        x, y = st.columns(2)
+        x.metric("Selected city test MAE", f"₹{mae:.4f}/L")
+        y.metric("Selected city test RMSE", f"₹{rmse:.4f}/L")
+    else:
+        st.warning("No saved test predictions are available for this city.")
+else:
+    st.warning(
+        "The test prediction file has different column names; "
+        "check its schema before plotting."
+    )
+
+# ---------------- CRUDE OIL ----------------
+st.divider()
+st.header("Crude oil historical trend")
+crude_valid = crude.dropna(subset=["date", "price"]).sort_values("date")
+
+if not crude_valid.empty:
+    crude_fig = go.Figure()
+    crude_fig.add_trace(
+        go.Scatter(
+            x=crude_valid["date"],
+            y=crude_valid["price"],
+            mode="lines",
+            name="Crude oil price",
+        )
+    )
+    crude_fig.update_layout(
+        xaxis_title="Date",
+        yaxis_title="Source price units",
+        hovermode="x unified",
     )
     st.plotly_chart(crude_fig, use_container_width=True)
     st.caption(
-        "Crude oil is shown as a historical supporting indicator. "
-        "Its source units are not assumed to be INR per litre."
+        "Crude oil is shown in the units supplied by the source CSV; "
+        "it is not assumed to be INR per litre."
     )
-else:
-    st.warning("No usable crude oil observations were found.")
 
-# --------------------------------------------------
-# Model evaluation
-# --------------------------------------------------
-st.divider()
-st.subheader("Model evaluation")
-
-if {"fuel", "model", "validation_MAE", "test_MAE"}.issubset(metrics.columns):
-    st.write(
-        "MAE measures the average absolute difference between actual and "
-        "predicted prices. Lower is better."
-    )
-    st.dataframe(metrics, use_container_width=True, hide_index=True)
-
-    selected_metrics = metrics[
-        metrics["fuel"].astype(str).str.lower() == fuel_type.lower()
-    ]
-    if not selected_metrics.empty:
-        st.write(f"**Evaluation for {fuel_type.lower()}:**")
-        st.dataframe(
-            selected_metrics,
-            use_container_width=True,
-            hide_index=True,
-        )
-else:
-    st.warning("The model comparison file does not contain the expected columns.")
-
-st.subheader("Held-out test predictions")
 st.caption(
-    "These are saved historical test predictions, not predictions for today's "
-    "market. The test set contains very few actual price-change events."
-)
-if not predictions.empty:
-    if "city" in predictions.columns:
-        displayed_predictions = predictions[
-            predictions["city"] == city
-        ].copy()
-    else:
-        displayed_predictions = predictions.copy()
-
-    st.dataframe(
-        displayed_predictions.tail(30),
-        use_container_width=True,
-        hide_index=True,
-    )
-
-st.divider()
-st.caption(
-    "Project note: the selected persistence baseline carries forward the "
-    "last recorded price. Validation data contained no price changes, so "
-    "perfect validation error does not establish reliable performance "
-    "during future price changes."
+    "Research limitation: the historical dataset has few price-change "
+    "events. A low test error does not guarantee accurate future price "
+    "changes, and this app is not connected to a live fuel-price feed."
 )
